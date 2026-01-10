@@ -1,430 +1,415 @@
 import streamlit as st
+import PyPDF2
+import io
 import os
-import tempfile
-from typing import List, Dict
-from datetime import datetime
+import time
+from pathlib import Path
 
-# LangChain imports
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.docstore.document import Document
-
-# Set page configuration
+# Set page config
 st.set_page_config(
-    page_title="RAG ChatBot",
+    page_title="Offline RAG ChatBot",
     page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS
+# Custom CSS for better UI
 st.markdown("""
 <style>
-    .main-header {
+    .stApp {
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    }
+    .main-title {
+        text-align: center;
+        color: #60a5fa;
         font-size: 2.5rem;
-        color: #4B8BBE;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #306998;
-        margin-top: 2rem;
-    }
-    .chat-message {
-        padding: 1rem;
-        border-radius: 0.5rem;
         margin-bottom: 1rem;
-        display: flex;
-        flex-direction: column;
+        background: linear-gradient(90deg, #60a5fa, #3b82f6);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
     }
-    .user-message {
-        background-color: #2d5d7b;
-        align-self: flex-end;
-        max-width: 70%;
-    }
-    .bot-message {
-        background-color: #1e3a5f;
-        align-self: flex-start;
-        max-width: 70%;
-    }
-    .file-uploader {
-        border: 2px dashed #4B8BBE;
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-    }
-    .stButton>button {
-        width: 100%;
-        background-color: #4B8BBE;
+    .offline-badge {
+        display: inline-block;
+        background: #10b981;
         color: white;
+        padding: 0.3rem 0.8rem;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        margin-left: 1rem;
+    }
+    .file-card {
+        background: rgba(30, 41, 59, 0.7);
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+    }
+    .stButton > button {
+        background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.5rem 2rem;
         font-weight: bold;
+    }
+    .chat-user {
+        background: linear-gradient(90deg, #1e293b, #0f172a);
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #3b82f6;
+    }
+    .chat-bot {
+        background: linear-gradient(90deg, #0f172a, #1e293b);
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #10b981;
     }
 </style>
 """, unsafe_allow_html=True)
 
+# Title
+st.markdown("""
+<h1 class="main-title">
+    🤖 Offline RAG ChatBot
+    <span class="offline-badge">100% LOCAL</span>
+</h1>
+<p style="text-align: center; color: #94a3b8; margin-bottom: 2rem;">
+    No API keys needed • Works completely offline • Private & Secure
+</p>
+""", unsafe_allow_html=True)
+
 # Initialize session state
-def init_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "vector_store" not in st.session_state:
-        st.session_state.vector_store = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "documents_processed" not in st.session_state:
-        st.session_state.documents_processed = False
-    if "processing_complete" not in st.session_state:
-        st.session_state.processing_complete = False
-    if "embeddings_model" not in st.session_state:
-        st.session_state.embeddings_model = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "models_loaded" not in st.session_state:
+    st.session_state.models_loaded = False
 
-init_session_state()
-
-# Sidebar for configuration
+# Sidebar
 with st.sidebar:
-    st.title("⚙️ Configuration")
+    st.markdown("### ⚙️ Configuration")
     
     # Model selection
-    st.subheader("Model Settings")
-    
-    model_option = st.selectbox(
-        "Select Embeddings Model",
-        ["OpenAI (requires API key)", "HuggingFace (free)"],
-        index=1
+    st.markdown("#### 🧠 Model Settings")
+    model_choice = st.selectbox(
+        "Choose Model Size",
+        ["Tiny (Fast, less accurate)", "Small (Good balance)", "Medium (Better accuracy)"],
+        index=1,
+        help="Smaller models are faster but less accurate"
     )
     
-    if model_option == "OpenAI (requires API key)":
-        api_key = st.text_input("OpenAI API Key", type="password")
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-            use_openai = True
-        else:
-            st.warning("Please enter OpenAI API key to use OpenAI embeddings")
-            use_openai = False
-    else:
-        use_openai = False
+    # Document processing
+    st.markdown("#### 📄 Document Processing")
+    chunk_size = st.slider("Chunk Size", 500, 2000, 1000, 
+                          help="Size of text chunks for processing")
+    chunk_overlap = st.slider("Chunk Overlap", 50, 500, 200,
+                             help="Overlap between chunks for context")
     
-    # Chunk settings
-    st.subheader("Document Processing")
-    chunk_size = st.slider("Chunk Size", 500, 2000, 1000, help="Size of text chunks for processing")
-    chunk_overlap = st.slider("Chunk Overlap", 50, 500, 200, help="Overlap between chunks")
-    
-    # File uploader
-    st.subheader("📁 Upload Documents")
+    # File upload
+    st.markdown("#### 📁 Upload Documents")
     uploaded_files = st.file_uploader(
-        "Choose files",
-        type=['pdf', 'txt'],
+        "Choose PDF files",
+        type=['pdf'],
         accept_multiple_files=True,
-        help="Upload PDF or Text files for the chatbot to process"
+        help="Upload PDF files to chat with"
     )
     
-    # Process button
-    if st.button("🚀 Process Documents", use_container_width=True):
-        if uploaded_files:
-            with st.spinner("Processing documents..."):
-                documents = []
-                
-                for uploaded_file in uploaded_files:
-                    # Save uploaded file temporarily
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=uploaded_file.name) as tmp_file:
-                        tmp_file.write(uploaded_file.getvalue())
-                        tmp_file_path = tmp_file.name
+    # Load models button
+    if not st.session_state.models_loaded:
+        if st.button("🔧 Load AI Models", use_container_width=True):
+            with st.spinner("Downloading models (first time may take 2-3 minutes)..."):
+                try:
+                    # This will download the models
+                    from sentence_transformers import SentenceTransformer
+                    from transformers import pipeline
                     
-                    try:
-                        # Load document based on file type
-                        if uploaded_file.name.lower().endswith('.pdf'):
-                            loader = PyPDFLoader(tmp_file_path)
-                            docs = loader.load()
-                        elif uploaded_file.name.lower().endswith('.txt'):
-                            loader = TextLoader(tmp_file_path, encoding='utf-8')
-                            docs = loader.load()
-                        else:
-                            continue
+                    # Download embedding model
+                    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+                    st.session_state.embedding_model = embedding_model
+                    
+                    # Download small LLM
+                    st.info("Downloading language model... This may take a moment.")
+                    llm = pipeline(
+                        'text-generation',
+                        model='distilgpt2',  # Small model that works offline
+                        max_length=200,
+                        temperature=0.7
+                    )
+                    st.session_state.llm = llm
+                    
+                    st.session_state.models_loaded = True
+                    st.success("✅ Models loaded successfully!")
+                    
+                except Exception as e:
+                    st.error(f"Error loading models: {str(e)}")
+                    st.info("Make sure all dependencies are installed in requirements.txt")
+    else:
+        st.success("✅ Models are loaded and ready!")
+    
+    # Process documents button
+    if uploaded_files and st.session_state.models_loaded:
+        if st.button("🚀 Process Documents", use_container_width=True):
+            with st.spinner("Processing documents..."):
+                try:
+                    documents = []
+                    
+                    for uploaded_file in uploaded_files:
+                        # Read PDF
+                        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+                        text = ""
+                        for page_num, page in enumerate(pdf_reader.pages):
+                            text += f"\n--- Page {page_num+1} ---\n"
+                            text += page.extract_text()
                         
-                        documents.extend(docs)
-                        st.success(f"✅ Processed {uploaded_file.name}")
+                        documents.append({
+                            'name': uploaded_file.name,
+                            'text': text,
+                            'pages': len(pdf_reader.pages)
+                        })
+                    
+                    st.session_state.documents = documents
+                    
+                    # Create chunks
+                    from langchain.text_splitter import RecursiveCharacterTextSplitter
+                    
+                    all_chunks = []
+                    for doc in documents:
+                        text_splitter = RecursiveCharacterTextSplitter(
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                            length_function=len,
+                            separators=["\n\n", "\n", " ", ""]
+                        )
+                        
+                        chunks = text_splitter.split_text(doc['text'])
+                        for chunk in chunks:
+                            all_chunks.append({
+                                'text': chunk,
+                                'source': doc['name']
+                            })
+                    
+                    # Create embeddings and vector store
+                    import numpy as np
+                    from sentence_transformers import SentenceTransformer
+                    
+                    # Get embeddings
+                    model = st.session_state.embedding_model
+                    chunk_texts = [chunk['text'] for chunk in all_chunks]
+                    embeddings = model.encode(chunk_texts)
+                    
+                    # Simple vector store using FAISS
+                    try:
+                        import faiss
+                        dimension = embeddings.shape[1]
+                        index = faiss.IndexFlatL2(dimension)
+                        index.add(embeddings)
+                        
+                        st.session_state.vector_store = {
+                            'index': index,
+                            'chunks': all_chunks,
+                            'embeddings': embeddings
+                        }
+                        
+                        st.success(f"✅ Processed {len(documents)} documents into {len(all_chunks)} chunks")
                         
                     except Exception as e:
-                        st.error(f"Error processing {uploaded_file.name}: {str(e)}")
-                    finally:
-                        # Clean up temp file
-                        os.unlink(tmp_file_path)
-                
-                if documents:
-                    # Split documents into chunks
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=chunk_size,
-                        chunk_overlap=chunk_overlap,
-                        length_function=len,
-                        separators=["\n\n", "\n", " ", ""]
-                    )
-                    
-                    chunks = text_splitter.split_documents(documents)
-                    
-                    # Create embeddings
-                    with st.spinner("Creating embeddings..."):
-                        try:
-                            if use_openai and api_key:
-                                embeddings = OpenAIEmbeddings(
-                                    openai_api_key=api_key,
-                                    model="text-embedding-3-small"
-                                )
-                            else:
-                                # Use free HuggingFace embeddings
-                                embeddings = HuggingFaceEmbeddings(
-                                    model_name="sentence-transformers/all-MiniLM-L6-v2"
-                                )
-                            
-                            # Create vector store
-                            st.session_state.vector_store = FAISS.from_documents(
-                                chunks,
-                                embeddings
-                            )
-                            
-                            st.session_state.documents_processed = True
-                            st.session_state.processing_complete = True
-                            st.success(f"✅ Processed {len(documents)} documents into {len(chunks)} chunks")
-                            
-                        except Exception as e:
-                            st.error(f"Error creating embeddings: {str(e)}")
-                else:
-                    st.error("No documents could be loaded.")
-        else:
-            st.warning("Please upload at least one document.")
+                        # Fallback to simple similarity search
+                        st.warning("Using simple similarity search (FAISS not available)")
+                        st.session_state.vector_store = {
+                            'chunks': all_chunks,
+                            'embeddings': embeddings
+                        }
+                        st.success(f"✅ Processed {len(documents)} documents")
+                        
+                except Exception as e:
+                    st.error(f"Error processing documents: {str(e)}")
     
-    # Clear chat button
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
+    # Clear button
+    if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.messages = []
-        st.session_state.chat_history = []
         st.rerun()
-    
-    # Information section
-    st.sidebar.markdown("---")
-    st.sidebar.info("""
-    **How to use:**
-    1. Upload PDF/TXT documents
-    2. Click 'Process Documents'
-    3. Start chatting!
-    
-    **Features:**
-    - RAG-based responses
-    - Document source citation
-    - Conversation memory
-    - Free embeddings option
-    """)
 
 # Main content area
-st.markdown('<h1 class="main-header">🤖 RAG ChatBot</h1>', unsafe_allow_html=True)
-
-# Display status
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.session_state.documents_processed:
-        st.success("✅ Documents Ready")
-    else:
-        st.warning("📄 Upload Documents")
-with col2:
-    if st.session_state.vector_store:
-        st.success("🔍 Vector Store Loaded")
-    else:
-        st.warning("🔍 Vector Store Empty")
-with col3:
-    st.info(f"💬 {len(st.session_state.messages)} Messages")
+# Display documents if processed
+if st.session_state.documents:
+    st.markdown("### 📚 Processed Documents")
+    for doc in st.session_state.documents:
+        with st.expander(f"📄 {doc['name']} ({doc['pages']} pages)"):
+            st.text(doc['text'][:500] + "..." if len(doc['text']) > 500 else doc['text'])
 
 # Chat interface
-st.markdown('<h3 class="sub-header">💬 Chat</h3>', unsafe_allow_html=True)
+st.markdown("### 💬 Chat with Your Documents")
 
-# Display chat messages
-chat_container = st.container()
-
-with chat_container:
-    for message in st.session_state.messages:
-        if message["role"] == "user":
-            st.markdown(f"""
-            <div class="chat-message user-message">
-                <strong>You:</strong><br>
-                {message["content"]}
-                <small style="opacity: 0.7; text-align: right;">{message["timestamp"]}</small>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="chat-message bot-message">
-                <strong>🤖 Assistant:</strong><br>
-                {message["content"]}
-                <small style="opacity: 0.7; text-align: right;">{message["timestamp"]}</small>
-            </div>
-            """, unsafe_allow_html=True)
+# Display chat history
+for message in st.session_state.messages:
+    if message["role"] == "user":
+        st.markdown(f"""
+        <div class="chat-user">
+            <strong>👤 You:</strong> {message["content"]}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="chat-bot">
+            <strong>🤖 Assistant:</strong> {message["content"]}
+        </div>
+        """, unsafe_allow_html=True)
 
 # Chat input
-with st.form("chat_form", clear_on_submit=True):
-    user_input = st.text_area(
-        "Your message:",
-        height=100,
-        placeholder="Ask a question about your documents...",
-        key="user_input"
-    )
-    
-    col1, col2 = st.columns([6, 1])
-    with col2:
-        submit_button = st.form_submit_button("Send", use_container_width=True)
-
-# Process user input
-if submit_button and user_input:
-    if not st.session_state.vector_store:
-        st.error("Please upload and process documents first!")
+if prompt := st.chat_input("Ask about your documents..."):
+    if not st.session_state.models_loaded:
+        st.error("Please load the AI models from the sidebar first!")
         st.stop()
     
-    # Add user message to chat
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input,
-        "timestamp": timestamp
-    })
+    if not st.session_state.vector_store:
+        st.error("Please process some documents first!")
+        st.stop()
+    
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
     
     # Generate response
     with st.spinner("Thinking..."):
         try:
-            # Initialize LLM
-            if use_openai and api_key:
-                llm = ChatOpenAI(
-                    openai_api_key=api_key,
-                    model_name="gpt-3.5-turbo",
-                    temperature=0.7,
-                    streaming=False
-                )
-            else:
-                # Use a free alternative (you can change this to other free models)
-                from langchain_community.llms import HuggingFaceHub
-                llm = HuggingFaceHub(
-                    repo_id="google/flan-t5-large",
-                    model_kwargs={"temperature": 0.7, "max_length": 512}
-                )
+            # Search for relevant chunks
+            model = st.session_state.embedding_model
+            query_embedding = model.encode([prompt])
             
-            # Create retrieval chain
-            retriever = st.session_state.vector_store.as_retriever(
-                search_kwargs={"k": 3}
-            )
-            
-            memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True,
-                output_key="answer"
-            )
-            
-            # Add previous chat history to memory
-            for msg in st.session_state.messages[:-1]:  # Exclude current message
-                if msg["role"] == "user":
-                    memory.chat_memory.add_user_message(msg["content"])
-                else:
-                    memory.chat_memory.add_ai_message(msg["content"])
-            
-            qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                retriever=retriever,
-                memory=memory,
-                return_source_documents=True,
-                verbose=False
-            )
-            
-            # Get response
-            result = qa_chain({"question": user_input})
-            
-            # Format response with sources
-            response = result["answer"]
-            
-            # Add sources if available
-            if "source_documents" in result:
-                sources = []
-                for i, doc in enumerate(result["source_documents"][:2], 1):
-                    source_info = f"Source {i}: "
-                    if doc.metadata.get("source"):
-                        filename = doc.metadata["source"].split("/")[-1]
-                        source_info += f"{filename}"
-                    if doc.metadata.get("page"):
-                        source_info += f" (Page {doc.metadata['page']})"
-                    sources.append(source_info)
+            if 'index' in st.session_state.vector_store:
+                # Use FAISS for search
+                import faiss
+                index = st.session_state.vector_store['index']
+                D, I = index.search(query_embedding, 3)  # Get top 3 results
                 
-                if sources:
-                    response += "\n\n**Sources:**\n" + "\n".join(sources)
+                relevant_chunks = []
+                for idx in I[0]:
+                    if idx < len(st.session_state.vector_store['chunks']):
+                        chunk = st.session_state.vector_store['chunks'][idx]
+                        relevant_chunks.append(chunk['text'])
+            else:
+                # Simple similarity search
+                import numpy as np
+                from sklearn.metrics.pairwise import cosine_similarity
+                
+                embeddings = st.session_state.vector_store['embeddings']
+                similarities = cosine_similarity(query_embedding, embeddings)[0]
+                top_indices = np.argsort(similarities)[-3:][::-1]
+                
+                relevant_chunks = []
+                for idx in top_indices:
+                    chunk = st.session_state.vector_store['chunks'][idx]
+                    relevant_chunks.append(chunk['text'])
             
-            # Add bot response to chat
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": response,
-                "timestamp": timestamp
-            })
+            # Prepare context
+            context = "\n\n".join(relevant_chunks[:3])
             
-            # Rerun to display new messages
+            # Generate answer using local LLM
+            llm = st.session_state.llm
+            
+            prompt_template = f"""Based on the following context, answer the question.
+            
+            Context:
+            {context}
+            
+            Question: {prompt}
+            
+            Answer:"""
+            
+            response = llm(
+                prompt_template,
+                max_length=300,
+                temperature=0.7,
+                do_sample=True,
+                pad_token_id=50256
+            )[0]['generated_text']
+            
+            # Extract just the answer part
+            if "Answer:" in response:
+                answer = response.split("Answer:")[-1].strip()
+            else:
+                answer = response.strip()
+            
+            # Add bot response
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            
+            # Rerun to show new messages
             st.rerun()
             
         except Exception as e:
             st.error(f"Error generating response: {str(e)}")
+            # Fallback to simple keyword-based response
+            all_text = ""
+            for doc in st.session_state.documents:
+                all_text += doc['text'] + "\n\n"
+            
+            # Simple keyword matching
+            keywords = prompt.lower().split()
+            sentences = all_text.split('.')
+            relevant = []
+            
+            for sentence in sentences:
+                if any(keyword in sentence.lower() for keyword in keywords):
+                    relevant.append(sentence.strip())
+            
+            if relevant:
+                answer = f"I found this information: {' '.join(relevant[:3])}"
+            else:
+                answer = "I couldn't find specific information about that in your documents."
+            
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.rerun()
 
-# Information tabs
+# Information section
 st.markdown("---")
-tab1, tab2, tab3 = st.tabs(["📊 About", "🔧 How It Works", "📋 Document Info"])
+st.markdown("### ℹ️ How It Works")
 
-with tab1:
+col1, col2, col3 = st.columns(3)
+
+with col1:
     st.markdown("""
-    ### RAG ChatBot Application
-    
-    **Retrieval-Augmented Generation (RAG)** combines:
-    - Document retrieval from your uploaded files
-    - Language model generation for contextual responses
-    
-    **Features:**
-    - Document upload (PDF/TXT)
-    - Smart text chunking
-    - Vector embeddings for semantic search
-    - Conversation memory
-    - Source citation
+    #### 📥 **Offline Models**
+    - Uses free, downloadable models
+    - No internet required after setup
+    - Your data stays private
     """)
 
-with tab2:
+with col2:
     st.markdown("""
-    ### How It Works
-    
-    1. **Document Processing:**
-       - Upload PDF/TXT files
-       - Text extraction and splitting
-       - Chunking with configurable overlap
-    
-    2. **Vector Embeddings:**
-       - Convert text to numerical vectors
-       - Store in FAISS vector database
-       - Enable semantic search
-    
-    3. **Retrieval & Generation:**
-       - User query triggers similarity search
-       - Retrieve relevant document chunks
-       - Generate contextual response using LLM
-    
-    4. **Memory:**
-       - Maintains conversation history
-       - Provides context-aware responses
+    #### 🔍 **Document Processing**
+    - Extracts text from PDFs
+    - Creates searchable chunks
+    - Uses local embeddings
     """)
 
-with tab3:
-    if st.session_state.vector_store:
-        st.success(f"Vector store contains embeddings for document chunks")
-        # You could add more detailed document information here
-    else:
-        st.info("No documents processed yet. Upload files to get started.")
+with col3:
+    st.markdown("""
+    #### 🤖 **Local AI**
+    - Runs entirely on your machine
+    - No API costs
+    - 100% private conversations
+    """)
+
+# Quick setup instructions
+with st.expander("⚡ Quick Setup Guide"):
+    st.markdown("""
+    1. **Click 'Load AI Models'** in the sidebar (first time takes 2-3 minutes)
+    2. **Upload PDF files** you want to chat with
+    3. **Click 'Process Documents'** to make them searchable
+    4. **Start asking questions!**
+    
+    **Note:** The first time you load models, it will download them (about 300MB total).
+    Subsequent runs will be much faster as models are cached.
+    """)
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: #666;'>"
-    "RAG ChatBot • Built with Streamlit & LangChain • "
-    "Upload documents and start chatting!"
+    "<div style='text-align: center; color: #64748b;'>"
+    "🤖 Offline RAG ChatBot • No API Keys • 100% Local • Private & Secure"
     "</div>",
     unsafe_allow_html=True
 )
